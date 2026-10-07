@@ -3,17 +3,28 @@
 """
 CAN-WIFI 上位机 —— 串口配置工具
 
-通过串口（ESP32 USB-Serial/JTAG 或 UART 桥）对 CAN-WIFI 设备做 WiFi 配置与状态查询。
-命令协议见 CAN-WIFI 固件 main/serial_cli.c：
-  help / info / status / mode ap|sta / ssid <名称> / pass <密码> / ip [auto|x.x.x.x] / reboot
+通过串口（ESP32 USB-Serial/JTAG 或 UART 桥）对 CAN-WIFI 设备做 WiFi/邮箱配置与状态查询。
+命令协议见 CAN-WIFI 固件 main/serial_cli.c，完整说明见其 docs/serial-protocol.md：
+  help / info / status / mode ap|sta / ssid <名称> / pass <密码> / ip [auto|x.x.x.x]
+  / mail / mailto <邮箱> / mailauth <JSON> / mailcheck / reboot
   行结束符 \\r\\n；设备逐字符回显、无提示符；status 应答为单行 JSON
   （旧固件无 status 命令时自动退回解析 info 文本）。
 
+邮件版固件（2026-10-07 起）的协议要点：
+  - 单行上限 2047 字节（旧固件行缓冲为 128 字节），超长整行被拒绝；
+  - mailauth 的 JSON 参数由设备逐字节回显为 *，本工具本地消息同样掩码，不落明文；
+  - mailcheck 是异步命令：先回启动应答，数十秒后才输出 MAILCHECK OK/ERROR；
+  - status 增加 mail_from / mail_to / mail_configured 字段；
+  - can_ring 恒为 0（零条快照查询），收到报文数看 can_total。
+
 串口层的几个关键点（与固件联调得出的坑）：
-  - USB-Serial/JTAG 必须断言 DTR 设备才接收主机输入（open 后置 dtr=True）；
+  - USB-Serial/JTAG 断言 DTR（open 后置 dtr=True）、RTS=False，主机输入才稳定；
   - write_timeout 必须设置：USJ OUT 端点异常卡死时，无超时的 write 会永久阻塞；
+  - 长命令（约 1KB 的 mailauth）必须分片写入（32 字节 / 30ms），否则设备 FIFO 丢字节；
   - 设备重启（mode/reboot）会掉口，用后台线程按 1s 间隔自动重开。
 """
+
+__version__ = "0.2"
 
 import json
 import queue
@@ -41,8 +52,19 @@ LINE_END = "\r\n"
 UI_DRAIN_MS = 50                          # 串口事件排空周期
 TIMEOUT_S = 2.5                           # 命令应答超时
 POLL_MS = 2000                            # status 自动轮询周期
-CMD_MAX_BYTES = 120                       # 固件行缓冲 128 字节，留余量
+CMD_MAX_BYTES = 2047                      # 固件 CLI_LINE_MAX=2048，允许 2047 字节一行
+CMD_PACE_BYTES = 32                       # 长命令行分片大小（与 tools/provision-mail.py 一致）
+CMD_PACE_MS = 30                          # 分片间隔：设备每 20ms 才轮询一次 FIFO
+CMD_PACE_THRESHOLD = 64                   # 超过该长度就分片（并放后台线程写，不卡界面）
 RECONNECT_WINDOW_S = 15                   # 设备重启后的自动重连窗口
+MAILCHECK_TIMEOUT_S = 120                 # mailcheck 异步结果最多等多久
+SECRET_PREFIX = "mailauth "               # 设备对该前缀之后的参数逐字节回显为 *
+
+# 邮箱字段（与固件 main/mail_sender.h 一致）
+MAIL_SENDER = "espdata@agent.qq.com"      # 固件固定发件邮箱
+MAIL_ADDRESS_MAX = 128                    # mailto 地址上限（含结尾 NUL，故有效最长 127 字节）
+MAIL_CLIENT_MAX = 128                     # mailauth client_id 上限（有效最长 127 字节）
+MAIL_REFRESH_MAX = 1024                   # mailauth refresh_token 上限（有效最长 1023 字节）
 
 # ================= 深色主题（工业风） =================
 
@@ -75,7 +97,7 @@ def now_ts():
 
 
 def format_uptime(s):
-    """与固件 print_uptime 保持一致的中文时长。"""
+    """与固件 status.uptime_s 对应的中文时长（秒已按 60 归一化）。"""
     if s is None:
         return "—"
     s = int(s)
@@ -89,6 +111,84 @@ def format_uptime(s):
     if m:
         return f"{m}分{s}秒"
     return f"{s}秒"
+
+
+def uptime_from_text(text):
+    """
+    解析 info 的「运行:」行。
+
+    固件 print_uptime 的秒字段未对 60 取模（打印的是扣掉「天」「小时」后剩余的总秒数），
+    因此不能用 天/小时/分/秒 逐个相加：正确换算 = 天×86400 + 小时×3600 + 末尾秒数，
+    其中「分」只是末尾秒数 / 60 的冗余显示。解析失败返回 None。
+    """
+    m = re.fullmatch(
+        r"(?:(\d+)天)?(?:(\d+)小时)?(?:(\d+)分)?(?:(\d+)秒)?", (text or "").strip())
+    if m is None or not any(m.groups()):
+        return None
+    d, h, _mi, s = (int(v) if v else 0 for v in m.groups())
+    return d * 86400 + h * 3600 + s
+
+
+def mask_secret(cmd):
+    """设备把 mailauth 的参数逐字节回显为 *；本地日志同样掩码，避免凭据落到界面。"""
+    if cmd.startswith(SECRET_PREFIX):
+        n = len(cmd.encode("utf-8")) - len(SECRET_PREFIX)
+        return SECRET_PREFIX + "*" * max(n, 0)
+    return cmd
+
+
+def valid_mail_address(text):
+    """
+    与固件 mail_sender.c valid_address() 同规则的收件地址校验：
+    1~127 字节、单个 @ 且本地部分非空、域名含点且结尾不是点、仅 ASCII 字母数字与
+    .!#$%&'*+-/=?^_`{|}~@ 这些字符（故空格/中文/显示名/多收件人都会被设备拒绝）。
+    """
+    addr = (text or "").strip()
+    if text != addr:                      # 首尾空格会被固件当作参数一部分
+        return False
+    n = len(addr.encode("utf-8"))
+    if not 1 <= n < MAIL_ADDRESS_MAX:
+        return False
+    if addr.count("@") != 1:
+        return False
+    local, _, domain = addr.partition("@")
+    if not local or not domain or "." not in domain or domain.endswith("."):
+        return False
+    allowed = set(".!#$%&'*+-/=?^_`{|}~@")
+    for ch in addr:
+        if not ch.isascii() or not (ch.isalnum() or ch in allowed):
+            return False
+    return True
+
+
+def validate_mailauth_json(text):
+    """
+    导入前按固件 mail_import_auth() 的规则检查授权 JSON（字段名区分大小写）。
+    返回 (json字符串, 错误文本)；错误文本为 None 表示通过。
+    """
+    compact = "".join((text or "").splitlines()).strip()
+    if not compact:
+        return None, "请粘贴授权 JSON（单行 email/client_id/refresh_token）。"
+    try:
+        obj = json.loads(compact)
+    except ValueError:
+        return None, "不是合法 JSON，请检查是否粘贴完整（字段名区分大小写）。"
+    if not isinstance(obj, dict):
+        return None, "授权 JSON 必须是对象。"
+    email = obj.get("email")
+    client = obj.get("client_id")
+    refresh = obj.get("refresh_token")
+    if not isinstance(email, str) or email != MAIL_SENDER:
+        return None, f"email 必须是 {MAIL_SENDER}。"
+    if not isinstance(client, str) or not client:
+        return None, "client_id 必须是非空字符串。"
+    if len(client.encode("utf-8")) >= MAIL_CLIENT_MAX:
+        return None, f"client_id 最长 {MAIL_CLIENT_MAX - 1} 字节。"
+    if not isinstance(refresh, str) or not refresh:
+        return None, "refresh_token 必须是非空字符串。"
+    if len(refresh.encode("utf-8")) >= MAIL_REFRESH_MAX:
+        return None, f"refresh_token 最长 {MAIL_REFRESH_MAX - 1} 字节。"
+    return compact, None
 
 
 def blank_state():
@@ -109,6 +209,9 @@ def blank_state():
         "can_total": None,
         "twai": None,          # 'STOPPED'/'RUNNING'/... 或 None=未初始化
         "tec": None, "rec": None,
+        "mail_from": "",       # 固定发件邮箱（邮件版固件才有）
+        "mail_to": "",         # 当前收件邮箱
+        "mail_configured": None,   # True/False；None=旧固件未提供
     }
 
 
@@ -133,6 +236,10 @@ def state_from_json(obj):
     st["twai"] = obj.get("twai")
     st["tec"] = obj.get("tec")
     st["rec"] = obj.get("rec")
+    st["mail_from"] = str(obj.get("mail_from") or "")
+    st["mail_to"] = str(obj.get("mail_to") or "")
+    st["mail_configured"] = (bool(obj.get("mail_configured"))
+                             if obj.get("mail_configured") is not None else None)
     return st
 
 
@@ -193,6 +300,8 @@ def parse_info_lines(lines):
             st["mdns"] = m.group(1)
         elif (m := _RE_UPTIME.match(line)) is not None:
             st["uptime_text"] = m.group(1).strip()
+            # 秒字段未归一化（见 uptime_from_text），换算时不能逐项相加
+            st["uptime_s"] = uptime_from_text(st["uptime_text"])
         elif (m := _RE_CAN_RING.match(line)) is not None:
             st["can_ring"] = int(m.group(1))
         elif (m := _RE_TWAI.match(line)) is not None:
@@ -306,11 +415,28 @@ class SerialLink:
                 self.events.put(("data", data))
 
     def send_line(self, text):
+        """
+        写一行命令（自动补 CRLF）。
+
+        超过 CMD_PACE_THRESHOLD 的行走分片节奏（32 字节 / 30ms，与 tools/provision-mail.py
+        一致）：设备每 20ms 才轮询一次 FIFO，每次最多取 64 字节，整行高速写入约 1KB 的
+        mailauth 授权会丢字节。分片期间不持锁，避免拖住读线程。
+        """
+        data = (text + LINE_END).encode("utf-8")
         with self._lock:
             ser = self._ser
-            if ser is None:
-                raise serial.SerialException("串口未连接")
-            ser.write((text + LINE_END).encode("utf-8"))
+        if ser is None:
+            raise serial.SerialException("串口未连接")
+        if len(data) <= CMD_PACE_THRESHOLD:
+            ser.write(data)
+            return
+        for i in range(0, len(data), CMD_PACE_BYTES):
+            ser.write(data[i:i + CMD_PACE_BYTES])
+            try:
+                ser.flush()
+            except Exception:
+                pass
+            time.sleep(CMD_PACE_MS / 1000.0)
 
     def begin_reconnect(self, window=RECONNECT_WINDOW_S):
         """设备即将重启：后台线程按 ~1s 间隔尝试重开同一串口，直到窗口超时。"""
@@ -359,7 +485,7 @@ class PendingCmd:
 
     def __init__(self, cmd, kind="user", ok_tokens=(), fail_tokens=(),
                  on_done=None, timeout=TIMEOUT_S, json_mode=False,
-                 terminator=False, silent=False):
+                 terminator=False, silent=False, display=None):
         self.cmd = cmd.strip()
         self.kind = kind
         self.ok_tokens = ok_tokens
@@ -369,6 +495,8 @@ class PendingCmd:
         self.json_mode = json_mode
         self.terminator = terminator
         self.silent = silent
+        # 日志/状态栏里显示的命令文本：mailauth 授权默认掩码，绝不落明文
+        self.display = display if display is not None else mask_secret(self.cmd)
         self.lines = []
 
     def feed(self, line):
@@ -404,9 +532,11 @@ class PendingCmd:
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("CAN-WIFI 上位机 — 串口配置工具")
-        root.geometry("1000x680")
-        root.minsize(880, 600)
+        root.title(f"CAN-WIFI 上位机 v{__version__} — 串口配置工具")
+        # 邮箱区比旧版多了几行，按屏幕高度自适应（小屏仍可滚动窗口整体）
+        height = min(820, max(680, root.winfo_screenheight() - 120))
+        root.geometry(f"1040x{height}")
+        root.minsize(900, 660)
         self._setup_style()
         self._center_window()
 
@@ -602,6 +732,10 @@ class App:
         st_cap(r, "设备"); r += 1
         for key, name in (("uptime", "运行时间"), ("can", "CAN缓冲"), ("twai", "TWAI")):
             st_row(r, key, name); r += 1
+        st_sep(r); r += 1
+        st_cap(r, "邮箱"); r += 1
+        for key, name in (("mail_to", "收件邮箱"), ("mail_configured", "授权状态")):
+            st_row(r, key, name); r += 1
 
         self.autorefresh_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(left, text="自动刷新（2s）", variable=self.autorefresh_var,
@@ -686,6 +820,39 @@ class App:
         self.ip_text = tk.StringVar()
         ttk.Entry(ipf, textvariable=self.ip_text, width=15).pack(side="left")
         ttk.Button(ipf, text="设置 IP", command=self._set_ip).pack(side="right")
+        r += 1
+
+        ttk.Separator(cfg, orient="horizontal", style="Card.TSeparator").grid(
+            row=r, column=0, columnspan=3, sticky="ew", pady=(10, 8)); r += 1
+
+        ttk.Label(cfg, text="邮箱（邮件版固件）", style="Cap.TLabel").grid(
+            row=r, column=0, columnspan=3, sticky="w"); r += 1
+        ttk.Label(cfg, text="收件邮箱", style="Key.TLabel").grid(row=r, column=0, sticky="w")
+        self.mailto_var = tk.StringVar()
+        ttk.Entry(cfg, textvariable=self.mailto_var, width=28).grid(
+            row=r, column=1, sticky="we", padx=8)
+        ttk.Button(cfg, text="设置收件人", command=self._set_mailto).grid(
+            row=r, column=2, sticky="e")
+        r += 1
+        ttk.Label(cfg, text="授权 JSON（单行）", style="Key.TLabel").grid(
+            row=r, column=0, sticky="nw", pady=(6, 0))
+        self.mailauth_text = tk.Text(
+            cfg, height=2, width=28, wrap="none", bg=PAL["bg2"], fg=PAL["fg"],
+            insertbackground=PAL["fg"], selectbackground=PAL["accent"],
+            selectforeground="#FFFFFF", font=FONT_SMALL, relief="flat",
+            borderwidth=0, highlightthickness=1, highlightbackground=PAL["border"],
+            padx=4, pady=2)
+        self.mailauth_text.grid(row=r, column=1, sticky="we", padx=8, pady=(6, 0))
+        ttk.Button(cfg, text="导入授权", command=self._import_mailauth).grid(
+            row=r, column=2, sticky="e", pady=(6, 0))
+        r += 1
+        mailf = ttk.Frame(cfg, style="Card.TFrame")
+        mailf.grid(row=r, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(mailf, text="查看邮箱", width=9, command=self._do_mail).pack(side="left")
+        ttk.Button(mailf, text="验证连接", width=9, command=self._mailcheck).pack(
+            side="left", padx=8)
+        ttk.Label(mailf, text="设备回显为 *；验证不发信", style="Key.TLabel").pack(
+            side="left")
         r += 1
 
         ttk.Separator(cfg, orient="horizontal", style="Card.TSeparator").grid(
@@ -812,27 +979,38 @@ class App:
 
     def _send(self, cmd, ok_tokens=(), fail_tokens=(), on_done=None,
               kind="user", json_mode=False, terminator=False,
-              silent=False, timeout=TIMEOUT_S):
+              silent=False, timeout=TIMEOUT_S, display=None):
         if not self.link.is_open:
             return False
         if len(cmd.encode("utf-8")) > CMD_MAX_BYTES:
-            self._statusbar("命令过长，设备行缓冲为 128 字节", err=True)
+            self._statusbar(f"命令过长：设备单行上限 {CMD_MAX_BYTES} 字节", err=True)
             return False
         if any(p.cmd == cmd.strip() for p in self.pendings):
             return False                # 同一命令已在等待应答
-        try:
-            self.link.send_line(cmd)
-        except Exception as e:
-            self._statusbar(f"发送失败：{e}", err=True)
-            self._note(f"⚠ 发送失败：{e}（USJ 端点异常时请重新插拔 USB）")
-            return False
-        self.recent_sends.append((cmd.strip(), cmd.strip(), time.monotonic() + 5, silent))
+        shown = display if display is not None else mask_secret(cmd.strip())
+        long_write = len(cmd.encode("utf-8")) > CMD_PACE_THRESHOLD
+        if long_write:
+            # 长命令（授权 JSON）分片 + 后台写入，既不丢字节也不冻结界面
+            def worker():
+                try:
+                    self.link.send_line(cmd)
+                except Exception as e:      # 结果回报到事件队列，由 UI 线程提示
+                    self.events.put(("send_error", (cmd.strip(), str(e))))
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            try:
+                self.link.send_line(cmd)
+            except Exception as e:
+                self._statusbar(f"发送失败：{e}", err=True)
+                self._note(f"⚠ 发送失败：{e}（USJ 端点异常时请重新插拔 USB）")
+                return False
+        self.recent_sends.append((cmd.strip(), shown, time.monotonic() + 5, silent))
         if len(self.recent_sends) > 16:
             self.recent_sends.pop(0)
         self.pendings.append(PendingCmd(
             cmd, kind=kind, ok_tokens=ok_tokens, fail_tokens=fail_tokens,
             on_done=on_done, timeout=timeout, json_mode=json_mode,
-            terminator=terminator, silent=silent))
+            terminator=terminator, silent=silent, display=shown))
         return True
 
     # 各配置动作
@@ -917,6 +1095,111 @@ class App:
             self._statusbar(f"{name} 已保存，设备正在重连生效")
         else:
             self._statusbar(f"{name} 设置失败：{payload}", err=True)
+
+    # 邮箱动作（邮件版固件：mail / mailto / mailauth / mailcheck）
+
+    def _no_mail_support(self, name):
+        self._note(f"（设备不支持 {name}：需 2026-10-07 之后的邮件版固件）")
+
+    def _do_mail(self):
+        """mail：只读查看发件/收件邮箱与授权状态（不联网）。"""
+        self._send("mail", ok_tokens=["发件邮箱: "], fail_tokens=["未知命令"],
+                   on_done=lambda ok, pl, tk_: None if ok else self._no_mail_support("mail"))
+
+    def _set_mailto(self):
+        addr = self.mailto_var.get()
+        if not valid_mail_address(addr):
+            messagebox.showwarning(
+                "收件邮箱无效",
+                "需单个 ASCII 邮箱地址（1~127 字节）：一个 @、本地部分非空、"
+                "域名含点且不以点结尾；不接受空格、中文、显示名或多个收件人。")
+            return
+        addr = addr.strip()
+        self._send(
+            f"mailto {addr}",
+            ok_tokens=["收件邮箱已保存为 "],
+            fail_tokens=["收件邮箱设置失败", "未知命令"],
+            on_done=lambda ok, pl, tk_: self._after_mailto(ok, pl))
+
+    def _after_mailto(self, ok, payload):
+        if ok:
+            self._statusbar("收件邮箱已保存")
+            self._refresh_status()
+        else:
+            if payload == "未知命令":
+                self._no_mail_support("mailto")
+            self._statusbar(f"收件邮箱设置失败：{payload}", err=True)
+
+    def _import_mailauth(self):
+        raw = self.mailauth_text.get("1.0", "end")
+        compact, err = validate_mailauth_json(raw)
+        if err:
+            messagebox.showwarning("授权 JSON 无效", err)
+            return
+        cmd = "mailauth " + compact
+        nbytes = len(cmd.encode("utf-8"))
+        if nbytes > CMD_MAX_BYTES:
+            messagebox.showwarning(
+                "授权过长", f"命令 {nbytes} 字节，超过设备单行上限 {CMD_MAX_BYTES} 字节。")
+            return
+        sent = self._send(
+            cmd,
+            ok_tokens=["MAILAUTH OK："],
+            fail_tokens=["MAILAUTH ERROR：", "未知命令"],
+            timeout=TIMEOUT_S + 3.0,        # 1KB 授权分片写入约需 1s
+            on_done=lambda ok, pl, tk_: self._after_mailauth(ok, pl))
+        if sent:
+            self._statusbar(f"正在导入授权（{nbytes} 字节，分片写入）…")
+
+    def _after_mailauth(self, ok, payload):
+        if ok:
+            self.mailauth_text.delete("1.0", "end")   # 凭据不留在界面
+            self._note("── 邮箱授权已保存；可用「验证连接」检查联通性 ──")
+            self._statusbar("授权已保存（未联网验证）")
+            self._refresh_status()
+        elif payload == "未知命令":
+            self._no_mail_support("mailauth")
+            self._statusbar("导入失败：设备不支持 mailauth", err=True)
+        else:
+            self._statusbar(f"授权导入失败：{payload}", err=True)
+
+    def _mailcheck(self):
+        """mailcheck：异步自检，先回启动应答，数十秒后独立输出 MAILCHECK OK/ERROR。"""
+        if any(p.kind == "mailcheck" for p in self.pendings):
+            self._statusbar("已有一次邮箱验证在进行中")
+            return
+        sent = self._send(
+            "mailcheck",
+            ok_tokens=["正在验证设备邮箱连接"],
+            fail_tokens=["邮箱验证未启动", "未知命令"],
+            on_done=lambda ok, pl, tk_: self._after_mailcheck(ok, pl))
+        if sent:
+            self._statusbar("正在验证邮箱连接…（不发信，可能耗时数十秒）")
+        else:
+            self._statusbar("邮箱验证请求未发出（已有一次在进行中）")
+
+    def _after_mailcheck(self, ok, payload):
+        if ok:
+            # 结果稍后异步到达：挂一条长超时的观察命令等 MAILCHECK OK/ERROR
+            self.pendings.append(PendingCmd(
+                "mailcheck", kind="mailcheck", silent=False,
+                ok_tokens=["MAILCHECK OK："], fail_tokens=["MAILCHECK ERROR："],
+                timeout=MAILCHECK_TIMEOUT_S, display="mailcheck 结果",
+                on_done=lambda ok2, pl2, tk2: self._after_mailcheck_result(ok2, pl2)))
+            self._note("── 验证进行中（等待 MAILCHECK OK/ERROR）──")
+        elif payload == "未知命令":
+            self._no_mail_support("mailcheck")
+            self._statusbar("验证未启动：设备不支持 mailcheck", err=True)
+        else:
+            self._statusbar(f"验证未启动：{payload}", err=True)
+
+    def _after_mailcheck_result(self, ok, payload):
+        if ok:
+            self._note(f"── {payload} ──")
+            self._statusbar("邮箱验证通过（未发送邮件）")
+        else:
+            self._note(f"── {payload} ──")
+            self._statusbar(f"邮箱验证失败：{payload}", err=True)
 
     def _reboot(self):
         if not messagebox.askyesno("重启设备", "确定重启设备？"):
@@ -1019,9 +1302,14 @@ class App:
         d["iprule"].configure(text=iprule)
         d["mdns"].configure(text=f"http://{st['mdns']}.local" if st["mdns"] else "—")
         d["uptime"].configure(
-            text=st["uptime_text"] or format_uptime(st["uptime_s"]))
+            text=format_uptime(st["uptime_s"]) if st["uptime_s"] is not None
+            else (st["uptime_text"] or "—"))
         if st["can_total"] is not None:
-            d["can"].configure(text=f"{st['can_ring']} 条待显示（累计 {st['can_total']}）")
+            # can_ring 在邮件版固件里恒为 0（零条快照查询），累计值看 can_total
+            can = f"累计 {st['can_total']} 条"
+            if st["can_ring"]:
+                can += f"（待显示 {st['can_ring']}）"
+            d["can"].configure(text=can)
         else:
             d["can"].configure(text=f"{st['can_ring']} 条待显示" if st["can_ring"] else "—")
         if st["twai"]:
@@ -1029,6 +1317,16 @@ class App:
         else:
             twai = "未初始化" if st["mode"] is not None else "—"
         d["twai"].configure(text=twai)
+        d["mail_to"].configure(text=st["mail_to"] or "—")
+        if st["mail_configured"] is None:
+            mail_cfg = "—（旧固件未提供）"
+        elif st["mail_configured"]:
+            mail_cfg = "已配置（发信时验证并自动续期）"
+        else:
+            mail_cfg = "未配置，请导入授权"
+        d["mail_configured"].configure(text=mail_cfg)
+        if st["mail_to"] and not self.mailto_var.get():
+            self.mailto_var.set(st["mail_to"])
         self._sync_radios_from_state(st)
         self._color_state(st)
 
@@ -1048,6 +1346,12 @@ class App:
             twai_fg = {"RUNNING": PAL["ok"],
                        "RECOVERING": PAL["warn"]}.get(st["twai"], PAL["err"])
         labels["twai"].configure(foreground=twai_fg)
+        mail_fg = PAL["fg_dim"]
+        if st["mail_configured"] is True:
+            mail_fg = PAL["ok"]
+        elif st["mail_configured"] is False:
+            mail_fg = PAL["warn"]
+        labels["mail_configured"].configure(foreground=mail_fg)
 
     def _sync_radios_from_state(self, st=None):
         if st is None:
@@ -1080,6 +1384,8 @@ class App:
                     self._on_reconnected()
                 elif kind == "reconnect_failed":
                     self._on_reconnect_failed()
+                elif kind == "send_error":
+                    self._on_send_error(payload)
         except queue.Empty:
             pass
         self.root.after(UI_DRAIN_MS, self._drain_events)
@@ -1091,6 +1397,17 @@ class App:
             line = raw.decode("utf-8", errors="replace").rstrip("\r")
             if line:
                 self._handle_line(line)
+
+    def _classify_line(self, line):
+        """终端行着色：JSON=状态绿、OK=绿、错误与未启动=红、其余=普通。"""
+        if line.startswith("{"):
+            return "status"
+        if line.startswith(("MAILCHECK OK", "MAILAUTH OK")):
+            return "status"
+        if ("未知命令" in line or "失败" in line or "ERROR" in line
+                or line.startswith("邮箱验证未启动") or "命令过长" in line):
+            return "err"
+        return "rx"
 
     def _handle_line(self, line):
         # 1) 先喂给在途命令（内容匹配）
@@ -1117,10 +1434,8 @@ class App:
                 else ("sent", disp)
         elif consumed_by_silent:
             tag, shown = None, None
-        elif line.startswith("{"):
-            tag, shown = "status", line
-        elif "未知命令" in line or "失败" in line:
-            tag, shown = "err", line
+        else:
+            tag = self._classify_line(line)
         if shown is not None:
             self._term_append(shown, tag)
         # 3) 回调（可能再次 _send，如旧固件回退 info）
@@ -1136,14 +1451,26 @@ class App:
         expired = [p for p in self.pendings if now > p.deadline]
         for p in expired:
             self.pendings.remove(p)
-            if p.kind == "user" or not p.silent:
-                self._statusbar(f"命令无应答：{p.cmd}", err=True)
+            if p.kind == "mailcheck":
+                self._statusbar("邮箱验证仍未返回结果（超时）", err=True)
+                self._note("⚠ 未在超时前收到 MAILCHECK OK/ERROR；"
+                           "任务可能仍在设备上运行，稍后再点「验证连接」。")
+            elif p.kind == "user" or not p.silent:
+                self._statusbar(f"命令无应答：{p.display}", err=True)
             if p.on_done:
                 try:
                     p.on_done(False, None, None)
                 except Exception:
                     pass
         self.root.after(300, self._check_timeouts)
+
+    def _on_send_error(self, payload):
+        """后台分片写入失败：撤掉在途命令并提示（长命令不阻塞界面，靠事件回报）。"""
+        cmd, msg = payload
+        self.pendings = [p for p in self.pendings if p.cmd != cmd]
+        self.recent_sends = [i for i in self.recent_sends if i[0] != cmd]
+        self._statusbar(f"发送失败：{msg}", err=True)
+        self._note(f"⚠ 发送失败：{msg}（USJ 端点异常时请重新插拔 USB）")
 
     def _on_link_lost(self, gen=None):
         if gen is not None and gen != self.link.generation:
