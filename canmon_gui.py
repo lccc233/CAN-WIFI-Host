@@ -44,6 +44,31 @@ POLL_MS = 2000                            # status 自动轮询周期
 CMD_MAX_BYTES = 120                       # 固件行缓冲 128 字节，留余量
 RECONNECT_WINDOW_S = 15                   # 设备重启后的自动重连窗口
 
+# ================= 深色主题（工业风） =================
+
+FONT_UI = ("Microsoft YaHei UI", 9)
+FONT_SMALL = ("Microsoft YaHei UI", 8)
+FONT_TITLE = ("Microsoft YaHei UI", 10, "bold")
+FONT_TERM = ("Consolas", 10)
+
+PAL = {
+    "bg":       "#16191E",   # 窗口底
+    "bg1":      "#1F242C",   # 卡片底
+    "bg2":      "#2A313C",   # 输入框/按钮底
+    "bg3":      "#353E4B",   # 悬停
+    "border":   "#39424F",
+    "fg":       "#E6E9EE",
+    "fg_dim":   "#9AA4B2",
+    "accent":   "#3B82F6",   # 主色（连接/应用按钮、模式高亮）
+    "accent_h": "#5A9BFF",
+    "ok":       "#34D399",   # 已连接 / TWAI RUNNING
+    "warn":     "#FBBF24",   # RECOVERING / AP 未启动
+    "err":      "#F87171",   # 错误 / BUS_OFF
+    "danger":   "#7F1D1D",   # 重启设备按钮
+    "danger_h": "#991B1B",
+    "term_bg":  "#121418",   # 终端与状态栏底
+}
+
 
 def now_ts():
     return time.strftime("%H:%M:%S")
@@ -380,8 +405,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("CAN-WIFI 上位机 — 串口配置工具")
-        root.geometry("980x660")
-        root.minsize(860, 560)
+        root.geometry("1000x680")
+        root.minsize(880, 600)
+        self._setup_style()
+        self._center_window()
 
         self.events = queue.Queue()
         self.link = SerialLink(self.events)
@@ -401,51 +428,187 @@ class App:
 
     # ---------- 界面搭建 ----------
 
-    def _build_ui(self):
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(1, weight=1)
+    def _setup_style(self):
+        """clam 主题 + 深色调色板，所有控件统一走样式。"""
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        self.root.configure(bg=PAL["bg"])
+        # Combobox 下拉列表（Tk 经典列表框，只能 option_add）
+        self.root.option_add("*TCombobox*Listbox.background", PAL["bg2"])
+        self.root.option_add("*TCombobox*Listbox.foreground", PAL["fg"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", PAL["accent"])
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
 
-        top = ttk.Frame(self.root, padding=(8, 8, 8, 0))
-        top.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(top, text="串口：").pack(side="left")
+        style.configure(".", background=PAL["bg"], foreground=PAL["fg"],
+                        bordercolor=PAL["border"], lightcolor=PAL["bg1"],
+                        darkcolor=PAL["bg1"], troughcolor=PAL["bg"],
+                        focuscolor=PAL["accent"], selectbackground=PAL["accent"],
+                        selectforeground="#FFFFFF", font=FONT_UI, arrowsize=12)
+        style.configure("TFrame", background=PAL["bg"])
+        style.configure("TLabel", background=PAL["bg"], foreground=PAL["fg"])
+        style.configure("Dim.TLabel", background=PAL["bg"],
+                        foreground=PAL["fg_dim"], font=FONT_SMALL)
+        style.configure("Title.TLabel", background=PAL["bg"],
+                        foreground=PAL["fg"], font=FONT_TITLE)
+        style.configure("TSeparator", background=PAL["border"])
+
+        # 卡片
+        style.configure("Card.TFrame", background=PAL["bg1"])
+        style.configure("Card.TLabel", background=PAL["bg1"], foreground=PAL["fg"])
+        style.configure("Key.TLabel", background=PAL["bg1"],
+                        foreground=PAL["fg_dim"], font=FONT_SMALL)
+        style.configure("Cap.TLabel", background=PAL["bg1"],
+                        foreground=PAL["accent"], font=FONT_SMALL)
+        style.configure("Card.TLabelframe", background=PAL["bg1"], relief="solid",
+                        borderwidth=1, bordercolor=PAL["border"],
+                        lightcolor=PAL["border"], darkcolor=PAL["border"])
+        style.configure("Card.TLabelframe.Label", background=PAL["bg"],
+                        foreground=PAL["fg_dim"], font=FONT_SMALL)
+        style.configure("Card.TSeparator", background=PAL["border"])
+
+        # 按钮：普通 / 主色 / 危险
+        style.configure("TButton", background=PAL["bg2"], foreground=PAL["fg"],
+                        bordercolor=PAL["border"], relief="flat", padding=(10, 4))
+        style.map("TButton",
+                  background=[("disabled", PAL["bg"]), ("pressed", PAL["bg3"]),
+                              ("active", PAL["bg3"])],
+                  foreground=[("disabled", PAL["fg_dim"])],
+                  bordercolor=[("disabled", PAL["bg"])])
+        style.configure("Accent.TButton", background=PAL["accent"],
+                        foreground="#FFFFFF", bordercolor=PAL["accent"])
+        style.map("Accent.TButton",
+                  background=[("disabled", "#22375C"), ("pressed", PAL["accent_h"]),
+                              ("active", PAL["accent_h"])],
+                  foreground=[("disabled", "#6E88B0")])
+        style.configure("Danger.TButton", background=PAL["danger"],
+                        foreground="#FFD9D9", bordercolor=PAL["danger"])
+        style.map("Danger.TButton",
+                  background=[("disabled", PAL["bg"]), ("pressed", PAL["danger_h"]),
+                              ("active", PAL["danger_h"])],
+                  foreground=[("disabled", PAL["fg_dim"])],
+                  bordercolor=[("disabled", PAL["bg"])])
+
+        # 输入
+        style.configure("TEntry", fieldbackground=PAL["bg2"], foreground=PAL["fg"],
+                        insertcolor=PAL["fg"], lightcolor=PAL["bg2"],
+                        darkcolor=PAL["bg2"], padding=4)
+        style.map("TEntry", bordercolor=[("focus", PAL["accent"])],
+                  lightcolor=[("focus", PAL["accent"])],
+                  darkcolor=[("focus", PAL["accent"])])
+        style.configure("TCombobox", fieldbackground=PAL["bg2"], background=PAL["bg2"],
+                        foreground=PAL["fg"], arrowcolor=PAL["fg"], padding=3)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", PAL["bg2"])],
+                  foreground=[("readonly", PAL["fg"])],
+                  arrowcolor=[("disabled", PAL["fg_dim"]), ("active", PAL["accent"])],
+                  bordercolor=[("focus", PAL["accent"])])
+
+        # 单选/复选（指示点选中变主色）
+        style.configure("TRadiobutton", background=PAL["bg1"], foreground=PAL["fg"],
+                        focuscolor=PAL["accent"], indicatorcolor=PAL["bg2"], padding=2)
+        style.map("TRadiobutton",
+                  background=[("active", PAL["bg1"])],
+                  indicatorcolor=[("selected", PAL["accent"]), ("pressed", PAL["bg3"])])
+        style.configure("TCheckbutton", background=PAL["bg1"], foreground=PAL["fg_dim"],
+                        focuscolor=PAL["accent"], indicatorcolor=PAL["bg2"], padding=0)
+        style.map("TCheckbutton",
+                  background=[("active", PAL["bg1"])],
+                  indicatorcolor=[("selected", PAL["accent"]), ("pressed", PAL["bg3"])])
+
+        # 滚动条
+        style.configure("Vertical.TScrollbar", background=PAL["bg2"],
+                        troughcolor=PAL["term_bg"], bordercolor=PAL["bg1"],
+                        lightcolor=PAL["bg2"], darkcolor=PAL["bg2"],
+                        arrowcolor=PAL["fg_dim"], relief="flat")
+        style.map("Vertical.TScrollbar",
+                  background=[("active", PAL["bg3"]), ("pressed", PAL["accent"])])
+
+        # 底部状态栏
+        style.configure("Status.TFrame", background=PAL["term_bg"])
+        style.configure("Status.TLabel", background=PAL["term_bg"],
+                        foreground=PAL["fg_dim"])
+
+    def _center_window(self):
+        self.root.update_idletasks()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        x = max((self.root.winfo_screenwidth() - w) // 2, 0)
+        y = max((self.root.winfo_screenheight() - h) // 3, 0)
+        self.root.geometry(f"+{x}+{y}")
+
+    def _build_ui(self):
+        root = self.root
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+
+        # ----- 顶栏：标题 + 串口连接 -----
+        top = ttk.Frame(root, padding=(12, 10, 12, 8))
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, text="CAN-WIFI 上位机", style="Title.TLabel").pack(side="left")
+        ttk.Label(top, text="串口配置工具", style="Dim.TLabel").pack(
+            side="left", padx=(8, 0), pady=(3, 0))
+        self.dot = tk.Canvas(top, width=12, height=12, highlightthickness=0,
+                             bg=PAL["bg"])
+        self.dot_id = self.dot.create_oval(1, 1, 11, 11, fill="#4B5563", outline="")
+        self.dot.pack(side="right", pady=(4, 0))
+        self.btn_connect = ttk.Button(top, text="连接", width=9, style="Accent.TButton",
+                                      command=self._toggle_connect)
+        self.btn_connect.pack(side="right", padx=(0, 10))
+        self.btn_rescan = ttk.Button(top, text="刷新", width=6, command=self._rescan)
+        self.btn_rescan.pack(side="right")
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(top, textvariable=self.port_var,
-                                       width=42, state="readonly")
-        self.port_combo.pack(side="left", padx=(0, 6))
-        self.btn_rescan = ttk.Button(top, text="刷新", width=6, command=self._rescan)
-        self.btn_rescan.pack(side="left")
-        self.btn_connect = ttk.Button(top, text="连接", width=8, command=self._toggle_connect)
-        self.btn_connect.pack(side="left", padx=(6, 8))
-        self.dot = tk.Canvas(top, width=14, height=14, highlightthickness=0)
-        self.dot_id = self.dot.create_oval(2, 2, 12, 12, fill="#9E9E9E", outline="")
-        self.dot.pack(side="left")
+                                       width=44, state="readonly")
+        self.port_combo.pack(side="right", padx=(0, 8))
+        ttk.Label(top, text="串口", style="Dim.TLabel").pack(side="right", pady=(3, 0))
+        ttk.Separator(root, orient="horizontal").grid(row=1, column=0, sticky="ew")
 
-        body = ttk.Frame(self.root, padding=(8, 8))
-        body.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        body = ttk.Frame(root, padding=(12, 10))
+        body.grid(row=2, column=0, sticky="nsew")
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
-        # ----- 左：状态面板 -----
-        left = ttk.Labelframe(body, text=" 设备状态 ", padding=8)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        # ----- 左：状态卡片（WiFi / 网络 / 设备 三组） -----
+        left = ttk.Labelframe(body, text=" 设备状态 ", style="Card.TLabelframe", padding=10)
+        left.grid(row=0, column=0, sticky="nw", padx=(0, 10))
         self.status_labels = {}
-        rows = [
-            ("mode", "模式"), ("link", "连接"), ("ssid", "SSID"), ("rssi", "信号"),
-            ("channel", "信道"), ("ip", "IP"), ("netmask", "掩码"), ("gw", "网关"),
-            ("mac", "MAC"), ("iprule", "IP规则"), ("mdns", "mDNS"),
-            ("uptime", "运行时间"), ("can", "CAN缓冲"), ("twai", "TWAI"),
-        ]
-        for i, (key, name) in enumerate(rows):
-            ttk.Label(left, text=name + "：").grid(row=i, column=0, sticky="ne", pady=1)
-            val = ttk.Label(left, text="—", width=22, wraplength=170)
-            val.grid(row=i, column=1, columnspan=2, sticky="w", pady=1)
+
+        def st_row(r, key, name):
+            ttk.Label(left, text=name, style="Key.TLabel").grid(
+                row=r, column=0, sticky="w", pady=1)
+            val = ttk.Label(left, text="—", style="Card.TLabel", width=24, wraplength=190)
+            val.grid(row=r, column=1, sticky="w", pady=1, padx=(10, 0))
             self.status_labels[key] = val
+
+        def st_cap(r, text):
+            ttk.Label(left, text=text, style="Cap.TLabel").grid(
+                row=r, column=0, columnspan=2, sticky="w", pady=(8, 2))
+
+        def st_sep(r):
+            ttk.Separator(left, orient="horizontal",
+                          style="Card.TSeparator").grid(
+                row=r, column=0, columnspan=2, sticky="ew", pady=8)
+
+        r = 0
+        st_cap(r, "WIFI"); r += 1
+        for key, name in (("mode", "模式"), ("link", "连接"), ("ssid", "SSID"),
+                          ("rssi", "信号"), ("channel", "信道"), ("iprule", "IP规则")):
+            st_row(r, key, name); r += 1
+        st_sep(r); r += 1
+        st_cap(r, "网络"); r += 1
+        for key, name in (("ip", "IP"), ("netmask", "掩码"), ("gw", "网关"),
+                          ("mac", "MAC"), ("mdns", "mDNS")):
+            st_row(r, key, name); r += 1
+        st_sep(r); r += 1
+        st_cap(r, "设备"); r += 1
+        for key, name in (("uptime", "运行时间"), ("can", "CAN缓冲"), ("twai", "TWAI")):
+            st_row(r, key, name); r += 1
+
         self.autorefresh_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(left, text="自动刷新（2s）", variable=self.autorefresh_var,
                         command=self._manual_refresh).grid(
-            row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
+            row=r, column=0, columnspan=2, sticky="w", pady=(10, 0))
         ttk.Button(left, text="刷新状态", command=self._manual_refresh).grid(
-            row=len(rows) + 1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+            row=r + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         # ----- 右：终端 + 配置 -----
         right = ttk.Frame(body)
@@ -453,90 +616,95 @@ class App:
         right.columnconfigure(0, weight=1)
         right.rowconfigure(0, weight=1)
 
-        term_frame = ttk.Frame(right)
-        term_frame.grid(row=0, column=0, sticky="nsew")
-        term_frame.columnconfigure(0, weight=1)
-        term_frame.rowconfigure(1, weight=1)
-        term_head = ttk.Frame(term_frame)
-        term_head.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(term_head, text="终端").pack(side="left")
-        self.term = tk.Text(term_frame, height=10, state="disabled", wrap="none",
-                            bg="#1E1E1E", fg="#D4D4D4", insertbackground="#D4D4D4",
-                            font=("Consolas", 10), relief="flat")
+        term = ttk.Labelframe(right, text=" 终端 ", style="Card.TLabelframe", padding=8)
+        term.grid(row=0, column=0, sticky="nsew")
+        term.columnconfigure(0, weight=1)
+        term.rowconfigure(1, weight=1)
+        self.btn_clear = ttk.Button(term, text="清屏", width=6, command=self._clear_term)
+        self.btn_clear.grid(row=0, column=1, sticky="e", pady=(0, 6))
+        self.term = tk.Text(term, height=10, state="disabled", wrap="none",
+                            bg=PAL["term_bg"], fg="#C9CFD8", insertbackground="#C9CFD8",
+                            selectbackground=PAL["accent"], selectforeground="#FFFFFF",
+                            font=FONT_TERM, relief="flat", borderwidth=0,
+                            highlightthickness=1, highlightbackground=PAL["border"],
+                            padx=8, pady=6)
         self.term.grid(row=1, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(term_frame, orient="vertical", command=self.term.yview)
-        sb.grid(row=1, column=1, sticky="ns")
+        sb = ttk.Scrollbar(term, orient="vertical", command=self.term.yview)
+        sb.grid(row=1, column=1, sticky="ns", padx=(6, 0))
         self.term.configure(yscrollcommand=sb.set)
-        self.btn_clear = ttk.Button(term_head, text="清屏", width=6, command=self._clear_term)
-        self.btn_clear.pack(side="right")
-        for tag, fg in (("rx", "#D4D4D4"), ("sent", "#569CD6"),
-                        ("status", "#6A9955"), ("err", "#F48771"),
-                        ("ts", "#858585"), ("note", "#D7BA7D")):
+        for tag, fg in (("rx", "#C9CFD8"), ("sent", "#6CB2FF"),
+                        ("status", "#5FA97C"), ("err", "#F87171"),
+                        ("ts", "#5C6672"), ("note", "#D8B46A")):
             self.term.tag_configure(tag, foreground=fg)
 
-        cfg = ttk.Frame(right)
-        cfg.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        cfg.columnconfigure(0, weight=1)
+        cfg = ttk.Labelframe(right, text=" 配置 ", style="Card.TLabelframe", padding=10)
+        cfg.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        cfg.columnconfigure(1, weight=1)
 
-        f_mode = ttk.Labelframe(cfg, text=" WiFi 模式 ", padding=6)
-        f_mode.grid(row=0, column=0, sticky="ew")
+        r = 0
+        ttk.Label(cfg, text="WIFI 模式", style="Cap.TLabel").grid(
+            row=r, column=0, columnspan=3, sticky="w"); r += 1
         self.mode_var = tk.StringVar(value="sta")
-        ttk.Radiobutton(f_mode, text="STA（连接路由器）", value="sta",
+        modef = ttk.Frame(cfg, style="Card.TFrame")
+        modef.grid(row=r, column=0, columnspan=3, sticky="ew")
+        ttk.Radiobutton(modef, text="STA（连接路由器）", value="sta",
                         variable=self.mode_var,
                         command=self._touch_mode).pack(side="left")
-        ttk.Radiobutton(f_mode, text="AP（本机热点）", value="ap",
+        ttk.Radiobutton(modef, text="AP（本机热点）", value="ap",
                         variable=self.mode_var,
-                        command=self._touch_mode).pack(side="left", padx=(12, 0))
-        ttk.Button(f_mode, text="应用", width=8, command=self._apply_mode).pack(
-            side="left", padx=(12, 0))
+                        command=self._touch_mode).pack(side="left", padx=(16, 0))
+        ttk.Button(modef, text="应用", width=8, style="Accent.TButton",
+                   command=self._apply_mode).pack(side="right")
+        r += 1
 
-        f_wifi = ttk.Labelframe(cfg, text=" STA 连接 ", padding=6)
-        f_wifi.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        f_wifi.columnconfigure(1, weight=1)
-        ttk.Label(f_wifi, text="WiFi名称：").grid(row=0, column=0, sticky="e")
+        ttk.Label(cfg, text="STA 连接", style="Cap.TLabel").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(10, 0)); r += 1
+        ttk.Label(cfg, text="WiFi名称", style="Key.TLabel").grid(row=r, column=0, sticky="w")
         self.ssid_var = tk.StringVar()
-        ttk.Entry(f_wifi, textvariable=self.ssid_var, width=30).grid(
-            row=0, column=1, sticky="w")
-        ttk.Button(f_wifi, text="设置 SSID", width=12, command=self._set_ssid).grid(
-            row=0, column=2, padx=(8, 0))
-        ttk.Label(f_wifi, text="密码：").grid(row=1, column=0, sticky="e", pady=(4, 0))
+        ttk.Entry(cfg, textvariable=self.ssid_var, width=28).grid(
+            row=r, column=1, sticky="we", padx=8)
+        ttk.Button(cfg, text="设置 SSID", command=self._set_ssid).grid(
+            row=r, column=2, sticky="e")
+        r += 1
+        ttk.Label(cfg, text="密码", style="Key.TLabel").grid(row=r, column=0, sticky="w", pady=(6, 0))
         self.pass_var = tk.StringVar()
-        ttk.Entry(f_wifi, textvariable=self.pass_var, width=30).grid(
-            row=1, column=1, sticky="w", pady=(4, 0))
-        ttk.Button(f_wifi, text="设置密码", width=12, command=self._set_pass).grid(
-            row=1, column=2, padx=(8, 0), pady=(4, 0))
-        ttk.Label(f_wifi, text="8~63 字符", foreground="#757575").grid(
-            row=1, column=3, padx=(6, 0), pady=(4, 0))
+        ttk.Entry(cfg, textvariable=self.pass_var, width=28).grid(
+            row=r, column=1, sticky="we", padx=8, pady=(6, 0))
+        ttk.Button(cfg, text="设置密码", command=self._set_pass).grid(
+            row=r, column=2, sticky="e", pady=(6, 0))
+        r += 1
 
-        f_ip = ttk.Labelframe(cfg, text=" IP 设置 ", padding=6)
-        f_ip.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(cfg, text="IP 设置", style="Cap.TLabel").grid(
+            row=r, column=0, columnspan=3, sticky="w", pady=(10, 0)); r += 1
+        ipf = ttk.Frame(cfg, style="Card.TFrame")
+        ipf.grid(row=r, column=0, columnspan=3, sticky="ew")
         self.ip_var = tk.StringVar(value="auto")
-        ttk.Radiobutton(f_ip, text="自动 .250", value="auto", variable=self.ip_var,
+        ttk.Radiobutton(ipf, text="自动 .250", value="auto", variable=self.ip_var,
                         command=self._touch_ip).pack(side="left")
-        ttk.Radiobutton(f_ip, text="手动：", value="static", variable=self.ip_var,
-                        command=self._touch_ip).pack(side="left", padx=(12, 2))
+        ttk.Radiobutton(ipf, text="手动", value="static", variable=self.ip_var,
+                        command=self._touch_ip).pack(side="left", padx=(16, 6))
         self.ip_text = tk.StringVar()
-        ttk.Entry(f_ip, textvariable=self.ip_text, width=16).pack(side="left")
-        ttk.Button(f_ip, text="设置 IP", width=10, command=self._set_ip).pack(
-            side="left", padx=(8, 0))
+        ttk.Entry(ipf, textvariable=self.ip_text, width=15).pack(side="left")
+        ttk.Button(ipf, text="设置 IP", command=self._set_ip).pack(side="right")
+        r += 1
 
-        f_misc = ttk.Labelframe(cfg, text=" 其他 ", padding=6)
-        f_misc.grid(row=3, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(f_misc, text="info", width=10, command=lambda: self._send(
+        ttk.Separator(cfg, orient="horizontal", style="Card.TSeparator").grid(
+            row=r, column=0, columnspan=3, sticky="ew", pady=(10, 8)); r += 1
+        ttk.Button(cfg, text="info", width=9, command=lambda: self._send(
             "info", ok_tokens=["======== 设备状态 ========"], kind="user",
-            on_done=lambda *a: None)).pack(side="left")
-        ttk.Button(f_misc, text="help", width=10, command=lambda: self._send(
+            on_done=lambda *a: None)).grid(row=r, column=0, sticky="w")
+        ttk.Button(cfg, text="help", width=9, command=lambda: self._send(
             "help", ok_tokens=["命令列表:"], kind="user",
-            on_done=lambda *a: None)).pack(side="left", padx=(8, 0))
-        ttk.Button(f_misc, text="重启设备", width=10, command=self._reboot).pack(
-            side="left", padx=(8, 0))
+            on_done=lambda *a: None)).grid(row=r, column=1, sticky="w", padx=8)
+        ttk.Button(cfg, text="重启设备", width=9, style="Danger.TButton",
+                   command=self._reboot).grid(row=r, column=2, sticky="e")
 
         # ----- 底部状态栏 -----
-        sbf = ttk.Frame(self.root, padding=(8, 0, 8, 6))
-        sbf.grid(row=2, column=0, columnspan=2, sticky="ew")
-        self.sb_port = ttk.Label(sbf, text="未连接")
+        sbf = ttk.Frame(root, style="Status.TFrame", padding=(12, 5))
+        sbf.grid(row=3, column=0, sticky="ews")
+        self.sb_port = ttk.Label(sbf, text="未连接", style="Status.TLabel")
         self.sb_port.pack(side="left")
-        self.sb_msg = ttk.Label(sbf, text="就绪", foreground="#212121")
+        self.sb_msg = ttk.Label(sbf, text="就绪", style="Status.TLabel")
         self.sb_msg.pack(side="right")
 
         self._set_connected_ui(False)
@@ -563,7 +731,8 @@ class App:
         self.term.configure(state="disabled")
 
     def _statusbar(self, msg, err=False):
-        self.sb_msg.configure(text=msg, foreground="#C62828" if err else "#212121")
+        self.sb_msg.configure(text=msg,
+                              foreground=PAL["err"] if err else PAL["fg_dim"])
 
     # ---------- 串口连接 ----------
 
@@ -616,7 +785,7 @@ class App:
         self._refresh_status()
 
     def _set_connected_ui(self, on):
-        self.dot.itemconfigure(self.dot_id, fill="#2E7D32" if on else "#9E9E9E")
+        self.dot.itemconfigure(self.dot_id, fill=PAL["ok"] if on else "#4B5563")
         self.btn_connect.configure(text="断开" if on else "连接")
         state = "normal" if on else "disabled"
         for btn in self._config_buttons():
@@ -861,6 +1030,24 @@ class App:
             twai = "未初始化" if st["mode"] is not None else "—"
         d["twai"].configure(text=twai)
         self._sync_radios_from_state(st)
+        self._color_state(st)
+
+    def _color_state(self, st):
+        """关键状态值着色：模式=主色，连接=绿/红/黄，TWAI=绿/黄/红。"""
+        labels = self.status_labels
+        labels["mode"].configure(
+            foreground=PAL["accent"] if st["mode"] else PAL["fg_dim"])
+        link_fg = PAL["fg_dim"]
+        if st["mode"] == "ap":
+            link_fg = PAL["ok"] if st["link"] else PAL["warn"]
+        elif st["mode"] == "sta":
+            link_fg = PAL["ok"] if st["link"] else PAL["err"]
+        labels["link"].configure(foreground=link_fg)
+        twai_fg = PAL["fg_dim"]
+        if st["twai"]:
+            twai_fg = {"RUNNING": PAL["ok"],
+                       "RECOVERING": PAL["warn"]}.get(st["twai"], PAL["err"])
+        labels["twai"].configure(foreground=twai_fg)
 
     def _sync_radios_from_state(self, st=None):
         if st is None:
