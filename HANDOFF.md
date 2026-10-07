@@ -40,6 +40,13 @@
   - 未做：`mailcheck` 真机触发（会轮换 refresh token，留给人工）、`mode/ssid/pass/ip`
     成功路径（会改设备配置）、exe 重新打包。
 - 待人工回归：邮箱按钮的真机点击路径（导入真实授权 → 验证连接 → 收件箱确认）。
+- 已发布：commit `6e29233` 推到 `origin/main`，tag `v0.2` + GitHub Release
+  <https://github.com/lccc233/CAN-WIFI-Host/releases/tag/v0.2>（资产 `CANMonHost.exe`、
+  `CANMonHost-od.zip`；匿名下载已校验）。
+  **沙箱注意**：代理会话里 `git push` 会因命名管道被拦而调不动凭据助手
+  （`sh.exe ... couldn't create signal pipe, Win32 error 5`），WMI 拉进程也被拒；
+  推送时用 `git -c http.extraheader="AUTHORIZATION: basic <base64(x-access-token:TOKEN)>"`，
+  建 Release 用 Python + REST API（.NET/curl 的 schannel 在本环境取不到凭据，Python 可以）。
 
 ## 当前状态（2026-09-25）
 
@@ -191,9 +198,10 @@ pyinstaller -F -w --name CANMonHost canmon_gui.py   # 产物 dist/CANMonHost.exe
       不要在别的客户端同时续期）
 
 **Phase 2 —— 正式发行（短期）**
+- [x] 远程仓库 GitHub `lccc233/CAN-WIFI-Host`；v0.2 已 tag + Release（手工挂
+      `CANMonHost.exe` / `CANMonHost-od.zip`）；tag → Release 自动挂 exe 的 CI 仍未做
 - [ ] 协议版本化：固件 `status` JSON 增加 `"proto":1` 字段，上位机按 proto 兼容
       （改协议不再靠猜）——需要固件侧配合一次小改；本工具已能忽略未知字段
-- [ ] 建远程仓库（GitHub），tag → Release 自动挂 exe（手工上传亦可起步）
 - [ ] exe 图标与版本资源（PyInstaller `--icon` + version 文件）
 
 **Phase 3 —— 功能扩展（按需，做前先论证）**

@@ -23,6 +23,9 @@
 | `dist\CANMonHost-od\`（+ `CANMonHost-od.zip`） | **推荐**。文件夹版，启动不解压，秒开；整个文件夹拷给对方即可 |
 | `dist\CANMonHost.exe` | 单文件版，约 9.8MB；启动时要解压到 `%TEMP%`，在部分受限/沙箱环境会被拦（见下） |
 
+已发布版本也可直接从 GitHub Release 下载（无需克隆仓库）：
+<https://github.com/lccc233/CAN-WIFI-Host/releases>（当前 `v0.2`，含上述两个文件）。
+
 **新电脑无需安装任何东西**（Python、pyserial 都已打进 exe）。Windows 仅限 64 位；
 exe 未做代码签名，第一次运行若弹「无法验证发布者」，点「运行」即可。
 如被杀毒软件误报，添加信任。
